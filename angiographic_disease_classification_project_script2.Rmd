@@ -1,0 +1,161 @@
+---
+title: "angiographic_disease_classification_project_script2"
+author: "Olivia Wang"
+date: "7/29/2022"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+# Model 1:
+
+```{r}
+# set library
+setwd("~/Desktop")
+library(readr)
+library(tidymodels)
+library(tidyverse)
+
+# let train be training data set, test be test data set
+train <- read_csv("heart_train.csv")
+test <- read_csv("heart_test.csv")
+
+setwd("~/Desktop")
+
+```
+
+```{r}
+# drop nas if there have any na value
+train <- train %>% drop_na()
+# let train_y be num
+train_y <- train$num
+train_id <- train$id
+train_x <- train[, -c(1, 15)]
+```
+
+```{r}
+# set train_data 
+train_data <- data.frame(train_y, train_x)
+```
+
+
+```{r}
+library(dplyr)
+# change catigorocal variables be factors as well as "?"
+colNames <- c("train_y","sex", "cp", "fbs", "restecg", "exang", "slope", "ca", "thal")
+train_data <- train_data %>%
+       mutate_each_(funs(factor(.)),colNames)
+
+test <- test %>%
+       mutate_each_(funs(factor(.)),colNames)
+
+```
+
+
+```{r}
+# after tunning the parameters, I find when trees = 20, mtry = 13, min_n = 2 produced the largest f_means score
+
+basic_rec <- recipe(train_y ~., data = train_data) 
+
+set.seed(10)
+# identify the random forest classificantion model
+rf_predict_model <- rand_forest( trees = 20, 
+                                 mtry = 13,
+                                 min_n = 2) %>% 
+  set_engine("ranger") %>% 
+  set_mode("classification")
+
+# fit model with basic recipe
+rf_wflow <-
+ workflow() %>%
+ add_recipe(basic_rec) %>% 
+ add_model(rf_predict_model)
+
+rf_res <- rf_wflow %>%
+  fit(train_data)
+
+
+pred_1 <- test$id %>% 
+  bind_cols(predict(rf_res, new_data = test))
+
+# change column names
+colnames(pred_1) <- c("Id", "Predicted")
+
+pred_1
+setwd("~/Downloads")
+write_csv(pred_1, "rf_classi_prediction(20_13_2)")
+```
+
+
+
+
+
+
+# Model 2:
+
+```{r}
+# load the training and test data 
+train <- read_csv("heart_train.csv")
+test <- read_csv("heart_test.csv")
+```
+
+```{r}
+# load needed libraries
+library(tidymodels)
+library(readr)
+library(ranger)
+```
+
+```{r}
+# Assign names to variables
+num <- train$num
+train_id <- train$id
+train_x <- train[, -c(1, 15)]
+train_data <- cbind(num, train_x)
+
+# Switch the categorical variables into factors
+cat_cols <- c("sex", "cp", "fbs", "restecg", "exang", 
+              "slope", "ca", "thal", "num")
+train_data <- train_data %>% 
+  mutate_each_(funs(factor(.)), cat_cols)
+
+test <- test %>% 
+  mutate_each_(funs(factor(.)), cat_cols)
+```
+
+```{r}
+# Creatinglogarithmic recipes
+log_rec <- recipe(num ~., data = train_data) %>% 
+  step_dummy(all_nominal_predictors()) %>% 
+  step_log(oldpeak, base = 10, signed = TRUE)
+```
+
+```{r}
+set.seed(10)
+# random forest model with log_rec and tuned hyper-parameters
+rf_model_log <- 
+  rand_forest(mtry = 10, 
+              trees = 85, 
+              min_n = 7) %>% 
+  set_engine("ranger") %>% 
+  set_mode("classification")
+
+rf_wflow <-
+ workflow() %>%
+ add_recipe(log_rec) %>% 
+ add_model(rf_model_log)
+
+rf_res <- rf_wflow %>%
+  fit(train_data)
+
+pred <- test$id %>% 
+  bind_cols(predict(rf_res, new_data = test))
+colnames(pred) <- c("Id", "Predicted")
+```
+
+```{r}
+write_csv(pred, "rf_classi_log(m10_85_mn7)")
+```

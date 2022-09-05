@@ -1,0 +1,774 @@
+---
+title: "angiographic_disease_classification_project_script1"
+author: "Olivia Wang"
+output: pdf_document
+date: '2022-07-25'
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidymodels)
+library(ggplot2)
+library(ranger)
+library(xgboost)
+library(MASS)
+library(discrim)
+#install.packages("keras")
+library(keras)
+#install.packages("kernlab")
+library(kernlab)
+```
+
+```{r}
+library(readr)
+train <- read_csv("heart_train.csv")
+test <- read_csv("heart_test.csv")
+```
+
+## EXPLORATORY
+
+```{r}
+library(tidymodels)
+library(tidyverse)
+```
+
+### 1. Remove missing observations
+```{r}
+# reference : https://stackoverflow.com/questions/28061122/how-do-i-remove-question-mark-from-a-data-set-in-r
+# Replace ? with NA
+idx_train <- train == "?"
+idx_test <- test == "?"
+is.na(train) <- idx_train
+is.na(test) <- idx_test
+```
+
+```{r}
+num <- train$num
+train_id <- train$id
+train_x <- train[, -c(1, 15)]
+train_data <- cbind(num, train_x)
+
+sex <- train_data$sex
+cp <- train_data$cp
+fbs <- train_data$fbs
+restecg <- train_data$restecg
+exang <- train_data$exang
+slope <- train_data$slope
+ca <- train_data$ca
+thal <- train_data$thal
+```
+
+```{r}
+# Switch the categorical variables into factors
+cat_cols <- c("sex", "cp", "fbs", "restecg", "exang", 
+              "slope", "ca", "thal", "num")
+train_data <- train_data %>% 
+  mutate_each_(funs(factor(.)), cat_cols)
+
+test <- test %>% 
+  mutate_each_(funs(factor(.)), cat_cols)
+#str(train_data)
+```
+
+```{r}
+#install.packages("visdat")
+library(visdat)
+vis_dat(train_data)
+```
+
+
+
+### 2. Check correlation with numeric variables
+```{r}
+corre <- cor(train_data[, c(2, 5, 6, 9, 11)])
+up_cor <- corre            
+up_cor[upper.tri(up_cor)] <- 0
+diag(up_cor) <- 0
+#View(up_cor)
+```
+The correlations between the numeric variables are low, so we do not need to remove any numeric variables. 
+
+### 3. Plots
+```{r}
+# pairs(heart_train[, c(2, 5, 6, 9, 11, 15)])
+par(mfrow = c(2, 3))
+plot(train_data$age, num)
+plot(train_data$trestbps, num)
+plot(train_data$chol, num)
+plot(train_data$thalach, num)
+plot(train_data$oldpeak, num)
+```
+
+
+```{r}
+library(ggplot2)
+par(mfrow = c(2, 2))
+ggplot(data = train_data) +
+  geom_bar(mapping = aes(x = age), fill = "#F8766D") 
+
+ggplot(data = train_data) +
+  geom_bar(mapping = aes(x = trestbps), fill = "#E58700")
+
+ggplot(data = train_data) +
+  geom_bar(mapping = aes(x = chol), fill = "#C99800")
+
+ggplot(data = train_data) +
+  geom_bar(mapping = aes(x = thalach), fill = "#A3A500")
+
+ggplot(data = train_data) +
+  geom_bar(mapping = aes(x = oldpeak), fill = "#6BB100")
+```
+log transformation for oldpeak?
+
+### Boxplots for numeric variables
+```{r}
+boxplot(age ~ num, data = train_data, main = "age vs num")
+boxplot(trestbps ~ num, data = train_data, main = "trestbps vs num")
+boxplot(chol ~ num, data = train_data, main = "chol vs num")
+boxplot(thalach ~ num, data = train_data, main = "thalach vs num")
+boxplot(oldpeak ~ num, data = train_data, main = "oldpeak vs num")
+```
+
+
+```{r}
+# reference: https://datascience.csuchico.edu/event/ggplot2_intro1/#two-categorical-variables
+par(mfrow = c(3, 2))
+ggplot(train_data, aes(x=num, fill=sex)) + geom_bar(position="dodge")
+ggplot(train_data, aes(x=num, fill=cp)) + geom_bar(position="dodge")
+ggplot(train_data, aes(x=num, fill=fbs)) + geom_bar(position="dodge")
+ggplot(train_data, aes(x=num, fill=restecg)) + geom_bar(position="dodge")
+ggplot(train_data, aes(x=num, fill=exang)) + geom_bar(position="dodge")
+ggplot(train_data, aes(x=num, fill=slope)) + geom_bar(position="dodge")
+ggplot(train_data, aes(x=num, fill=ca)) + geom_bar(position="dodge")
+ggplot(train_data, aes(x=num, fill=thal)) + geom_bar(position="dodge")
+```
+
+```{r}
+# Tried to remove ca 
+```
+
+## Preprc and Recipe 
+```{r}
+basic_rec <- recipe(num ~., data = train_data) %>% 
+  step_dummy(all_nominal_predictors()) 
+
+log_rec <- basic_rec %>% 
+  step_log(oldpeak, base = 10, signed = TRUE)
+  
+norm_rec <- basic_rec %>% 
+  step_normalize(all_numeric_predictors()) 
+
+preproc <- 
+  list(basic = basic_rec, 
+       log = log_rec,
+       norm = norm_rec)
+```
+
+
+## Candidate Models 
+```{r}
+# LDA model
+lda_model <- 
+  discrim_linear() %>% 
+  set_engine("MASS") %>% 
+  set_mode("classification")
+
+# Logistic regression
+logi_model_tuning <- 
+  logistic_reg(penalty = tune(), mixture = tune()) %>%  
+  set_engine("glmnet") %>% 
+  set_mode("classification") 
+
+# Random forest with tuning 
+rf_model <- 
+  rand_forest(mtry = tune(), 
+              trees = tune(), 
+              min_n = tune()) %>% 
+  set_engine("ranger", importance = "impurity") %>% 
+  set_mode("classification")
+
+# XGboost with tuning
+xgb_model <- boost_tree(trees = tune(),
+                        tree_depth = tune(),
+                        min_n = tune(), 
+                        loss_reduction = tune(),
+                        sample_size = tune(),
+                        mtry = tune(), 
+                        learn_rate = tune()) %>% 
+  set_engine("xgboost") %>% 
+  set_mode("classification")
+
+# KNN with tuning
+knn_model <- nearest_neighbor(neighbors = tune()) %>% 
+  set_engine("kknn") %>% 
+  set_mode("classification") 
+
+# SVM model with rbf kernel and tuning 
+svm_model <- 
+  svm_rbf(cost = tune(),
+          rbf_sigma = tune()) %>% 
+  set_mode("classification") %>% 
+  set_engine("kernlab")
+```
+
+##Model evaluation and tuning
+
+### Cross Validation
+```{r}
+set.seed(666)
+folds <- vfold_cv(train_data, 10)
+keep_pred <- control_resamples(save_pred = TRUE, save_workflow = TRUE)
+```
+
+### Tuning for hyperparameters
+```{r}
+# knn model tuning with basic rec
+knn_grid <- grid_regular(neighbors(range(1, 100)), levels = 10)
+
+knn_wflow_basic <- workflow() %>% 
+  add_recipe(basic_rec) %>% 
+  add_model(knn_model)
+
+knn_res_basic <- knn_wflow_basic %>% tune_grid(
+    resamples = folds, 
+    grid = knn_grid,
+    metrics = metric_set(f_meas), 
+    control = control_resamples(save_pred = TRUE)
+  )
+
+knn_res_basic %>% show_best("f_meas", 1)
+
+# knn model tuning with log rec
+knn_wflow_log <- workflow() %>% 
+  add_recipe(log_rec) %>% 
+  add_model(knn_model)
+
+knn_res_log <- knn_wflow_log %>% 
+  tune_grid(
+    resamples = folds, 
+    grid = knn_grid,
+    metrics = metric_set(f_meas),
+    control = control_resamples(save_pred = TRUE)
+  )
+knn_res_log %>% show_best("f_meas", 1)
+
+# knn model tuning with norm rec
+knn_wflow_norm <- workflow() %>% 
+  add_recipe(norm_rec) %>% 
+  add_model(knn_model)
+
+knn_res_norm <- knn_wflow_norm %>% tune_grid(
+    resamples = folds, 
+    grid = knn_grid,
+    metrics = metric_set(f_meas),
+    control = control_resamples(save_pred = TRUE)
+  )
+knn_res_norm %>% show_best("f_meas", 1)
+```
+
+```{r}
+# radom forest tuning
+set.seed(1999)
+rf_grid <- grid_regular(mtry(range(1, 14)),
+                        trees(range(20, 100)),
+                        min_n(range(1, 10)),
+                           levels = 5)
+
+rf_wflow_basic <- workflow() %>% 
+  add_model(rf_model) %>% 
+  add_recipe(basic_rec)
+
+rf_fit_basic <- rf_wflow_basic %>% 
+  tune_grid(resamples = folds, 
+            grid = rf_grid,
+            metrics = metric_set(f_meas),
+            control = control_resamples(save_pred = TRUE))
+
+rf_fit_basic %>% show_best("f_meas", 1)
+```
+
+```{r}
+# decision tree model tuning with basic rec
+ set.seed(1999)
+ param <- parameters(tree_depth(),
+                     cost_complexity(), 
+                     min_n())
+ 
+ dt_grid <- grid_regular(param, level = 10)
+ 
+ dt_wflow_basic <- workflow() %>%
+   add_recipe(basic_rec) %>% 
+   add_model(dt_model)
+ 
+ dt_res_basic <- dt_wflow_basic %>% tune_grid(
+     resamples = folds,
+     grid = dt_grid,
+     metrics = metric_set(f_meas),
+     control = control_resamples(save_pred = TRUE))
+ 
+ collect_metrics(dt_res_basic)
+ dt_res_basic %>% show_best("f_meas", 1)
+ 
+ # decision tree model tuning with log rec
+ dt_wflow_log <- workflow() %>% add_recipe(log_rec) %>% add_model(dt_model)
+ dt_res_log <- dt_wflow_log %>% tune_grid(
+     resamples = folds,
+     grid = dt_grid,
+     metrics = metric_set(f_meas),
+     control = control_resamples(save_pred = TRUE)
+   )
+ dt_res_log %>% show_best("f_meas", 1)
+ 
+ # decision tree model tuning with norm rec
+ dt_wflow_norm <- workflow() %>% add_recipe(norm_rec) %>% add_model(dt_model)
+ dt_res_norm <- dt_wflow_norm %>% tune_grid(
+     resamples = folds,
+     grid = dt_grid,
+     metrics = metric_set(f_meas),
+     control = control_resamples(save_pred = TRUE)
+   )
+dt_res_norm %>% show_best("f_meas", 1)
+```
+
+```{r}
+### XGBoost tuning with basic rec
+set.seed(100)
+xgb_grid <- grid_latin_hypercube(
+  trees(),
+  tree_depth(),
+  min_n(),
+  loss_reduction(),
+  sample_size = sample_prop(),
+  finalize(mtry(), train_data),
+  learn_rate(),
+  size = 30
+)
+
+xgb_wf_basic <- workflow() %>%
+  add_model(xgb_model) %>% 
+  add_recipe(basic_rec)
+
+xgb_fit_basic <- tune_grid(
+  xgb_wf_basic,
+  resamples = folds,
+  grid = xgb_grid,
+  metrics = metric_set(f_meas),
+  control = control_grid(save_pred = TRUE))
+
+xgb_fit_basic %>% show_best("f_meas", 1)
+
+### XGBoost tuning with log rec
+xgb_wf_log <- workflow() %>%
+  add_model(xgb_model) %>% 
+  add_recipe(log_rec)
+
+xgb_fit_log <- tune_grid(
+  xgb_wf_log,
+  resamples = folds,
+  grid = xgb_grid,
+  metrics = metric_set(f_meas),
+  control = control_grid(save_pred = TRUE)
+)
+
+xgb_fit_log %>% show_best("f_meas", 1)
+
+### XGBoost tuning with norm rec
+xgb_wf_norm <- workflow() %>%
+  add_model(xgb_model) %>% 
+  add_recipe(norm_rec)
+
+xgb_fit_norm <- tune_grid(
+  xgb_wf_norm,
+  resamples = folds,
+  grid = xgb_grid,
+  metrics = metric_set(f_meas),
+  control = control_grid(save_pred = TRUE)
+)
+
+xgb_fit_norm %>% show_best("f_meas", 1)
+```
+
+```{r}
+# Logistics tuning with basic recipe
+param <- parameters(penalty(range(-2, 1)), mixture())
+logi_grid <- grid_regular(param, level = 10)
+
+logi_wf_basic <- workflow() %>% 
+  add_recipe(basic_rec) %>% 
+  add_model(log_model)
+
+logi_res_basic <- logi_wf_basic %>% 
+  tune_grid(
+    resamples = folds, 
+    grid = logi_grid,
+    metrics = metric_set(f_meas),
+    control = control_resamples(save_pred = TRUE)
+  )
+
+logi_res_basic %>% show_best("f_meas", 1)
+
+# Logistics tuning with log recipe
+logi_wf_log <- workflow() %>% 
+  add_recipe(log_rec) %>% 
+  add_model(log_model)
+
+logi_res_log <- logi_wf_log %>% 
+  tune_grid(
+    resamples = folds, 
+    grid = logi_grid,
+    metrics = metric_set(f_meas),
+    control = control_resamples(save_pred = TRUE)
+  )
+
+logi_res_log %>% show_best("f_meas", 1)
+
+# Logistic tuning with norm recipe
+logi_wf_norm <- workflow() %>% 
+  add_recipe(norm_rec) %>% 
+  add_model(log_model)
+
+logi_res_norm <- logi_wf_norm %>% 
+  tune_grid(
+    resamples = folds, 
+    grid = logi_grid,
+    metrics = metric_set(f_meas),
+    control = control_resamples(save_pred = TRUE)
+  )
+
+logi_res_norm%>% show_best("f_meas", 1)
+
+```
+
+```{r}
+# Neural network tuning with basic rec
+param <- parameters(epochs(), hidden_units(), dropout())
+nn_grid <- grid_regular(param, levels = 5)
+
+nn_wf_basic <- workflow() %>% 
+  add_model(nn_model) %>% 
+  add_recipe(basic_rec)
+
+nn_res_basic <- nn_wf_basic %>% 
+  tune_grid(
+    resamples = folds, 
+    grid = nn_grid,
+    metrics = metric_set(f_meas),
+    control = control_resamples(save_pred = TRUE)
+  )
+
+nn_res_basic %>% show_best("f_meas", 1)
+
+# Neural network tuning with log rec
+nn_wf_log <- workflow() %>% 
+  add_model(nn_model) %>% 
+  add_recipe(log_rec)
+
+nn_res_log <- nn_wf_log %>% 
+  tune_grid(
+    resamples = folds, 
+    grid = nn_grid,
+    metrics = metric_set(f_meas),
+    control = control_resamples(save_pred = TRUE)
+  )
+
+nn_res_log %>% show_best("f_meas", 1)
+
+# Neural network tuning with norm rec
+nn_wf_norm <- workflow() %>% 
+  add_model(nn_model) %>% 
+  add_recipe(norm_rec)
+
+nn_res_norm <- nn_wf_norm %>% 
+  tune_grid(
+    resamples = folds, 
+    grid = nn_grid,
+    metrics = metric_set(f_meas),
+    control = control_resamples(save_pred = TRUE)
+  )
+
+nn_res_norm %>% show_best("f_meas", 1)
+```
+
+```{r}
+# svm tuning with basic rec
+svm_grid <- grid_regular(cost(),rbf_sigma(), levels = 10)
+
+svm_wf_basic <- workflow() %>% 
+  add_model(svm_model) %>% 
+  add_recipe(basic_rec)
+
+svm_res_basic <- 
+  svm_wf_basic %>% 
+  tune_grid(
+    resamples = folds,
+    grid = svm_grid,
+     metrics = metric_set(f_meas),
+    control = control_resamples(save_pred = TRUE))
+
+svm_res_basic %>% show_best("f_meas", 1)
+
+# svm tuning with log rec
+svm_wf_log <- workflow() %>% 
+  add_model(svm_model) %>% 
+  add_recipe(log_rec)
+
+svm_res_log <- 
+  svm_wf_log %>% 
+  tune_grid(
+    resamples = folds, 
+    grid = svm_grid,
+    metrics = metric_set(f_meas),
+    control = control_resamples(save_pred = TRUE)
+  )
+
+svm_res_log %>% show_best("f_meas", 1)
+
+# svm tuning with norm rec
+svm_wf_norm <- workflow() %>% 
+  add_model(svm_model) %>% 
+  add_recipe(norm_rec)
+
+svm_res_norm <- 
+  svm_wf_norm %>% 
+  tune_grid(
+    resamples = folds,
+    grid = svm_grid,
+    metrics = metric_set(f_meas),
+    control = control_resamples(save_pred = TRUE)
+  )
+
+svm_res_norm %>% show_best("f_meas", 1)
+```
+
+### Create workflow set
+```{r}
+# Update models
+library(tidymodels)
+# KNN model best K = 23
+knn_model <- nearest_neighbor(neighbors = 23) %>%
+  set_engine("kknn") %>% 
+  set_mode("classification")
+
+# Logistic regression
+log_model <- 
+  logistic_reg(penalty = 0.3162278, mixture =0) %>%  
+  set_engine("glmnet") %>% 
+  set_mode("classification") 
+
+# Random forest
+rf_model <- 
+  rand_forest(mtry = 1, 
+              trees = 60, 
+              min_n = 7) %>% 
+  set_engine("ranger", importance = "impurity") %>% 
+  set_mode("classification")
+
+# Decision tree with tuning
+dt_model <- 
+   decision_tree(tree_depth = 1e-10, 
+                 min_n = 8,
+                 cost_complexity = 21) %>%
+   set_engine(engine = "rpart") %>%
+   set_mode("classification")
+
+#XGboost best parameters with basic rec
+# xgb_model_basic <- boost_tree(trees = 852,
+#                         tree_depth = 12,
+#                         min_n = 6, 
+#                         loss_reduction = 1.573721,
+#                         sample_size = 0.3887252,
+#                         mtry = 12, 
+#                         learn_rate = 2.947556e-05) %>% 
+#   set_engine("xgboost") %>% 
+#   set_mode("classification")
+
+#XGboost best parameters with log/norm rec
+xgb_model <- boost_tree(trees = 1270,
+                        tree_depth = 6,
+                        min_n = 12, 
+                        loss_reduction = 3.521858e-09,
+                        sample_size = 0.77090964,
+                        mtry = 3, 
+                        learn_rate = 2.391532e-08) %>% 
+  set_engine("xgboost") %>% 
+  set_mode("classification")
+
+#SVM model 
+svm_model <- 
+  svm_rbf(cost = 3.174802	,
+          rbf_sigma = 0.0004641589) %>% 
+  set_mode("classification") %>% 
+  set_engine("kernlab")
+
+```
+
+```{r}
+models <- list(
+  lda = lda_model,
+  #qda = qda_model,
+  knn = knn_model,
+  logi = log_model,
+  rf = rf_model,
+  #dt = dt_model,
+  #xgb_basic = xgb_model_basic,
+  xgb = xgb_model,
+  svm= svm_model
+)
+
+all_models <- workflow_set(preproc = preproc, models = models, cross=TRUE)
+```
+
+```{r}
+class_metric <- metric_set(accuracy, f_meas)
+all_models <- 
+  all_models %>% 
+  workflow_map("fit_resamples", 
+               seed = 100, verbose = TRUE,
+               metrics = class_metric, 
+               resamples = folds, control = keep_pred)
+
+set.seed(100)
+class_metric <- metric_set(f_meas)
+rank_results(all_models, rank_metric = "f_meas", select_best = TRUE)
+```
+
+```{r}
+autoplot(all_models)
+```
+
+## Prediction KNN
+```{r}
+knn_model <- 
+  nearest_neighbor(neighbors = 34) %>% # we can adjust the number of neighbors 
+  set_engine("kknn") %>% 
+  set_mode("classification") 
+
+knn_wflow <-
+ workflow() %>%
+ add_recipe(basic_rec) %>% 
+ add_model(knn_model)
+
+knn_res <- knn_wflow %>%
+  fit(train_new)
+
+pred <- test$id %>% 
+  bind_cols(predict(knn_res, new_data = test))
+colnames(pred) <- c("Id", "Predicted")
+
+```
+
+```{r}
+write_csv(pred, "knn_classi_pred(34_rmca)")
+```
+
+### Prediction logistic
+```{r}
+log_model <- 
+  logistic_reg(penalty = 0.3162278, mixture = 0) %>%  
+  set_engine("glmnet") %>% 
+  set_mode("classification") 
+
+log_wflow <-
+ workflow() %>%
+ add_recipe(basic_rec) %>% 
+ add_model(log_model)
+
+log_res <- log_wflow %>%
+  fit(train_data)
+
+pred <- test$id %>% 
+  bind_cols(predict(log_res, new_data = test))
+colnames(pred) <- c("Id", "Predicted")
+
+```
+
+```{r}
+write_csv(pred, "logi_classi_basic(p0.3162278_m0_rmca)")
+```
+
+
+### Prediction rf
+```{r}
+set.seed(10)
+rf_model <- 
+  rand_forest(mtry = 10, 
+              trees = 85, 
+              min_n = 7) %>% 
+  set_engine("ranger", importance = "impurity") %>% 
+  set_mode("classification")
+
+rf_wflow <-
+ workflow() %>%
+ add_recipe(log_rec) %>% 
+ add_model(rf_model)
+
+rf_res <- rf_wflow %>%
+  fit(train_data)
+
+pred <- test$id %>% 
+  bind_cols(predict(rf_res, new_data = test))
+colnames(pred) <- c("Id", "Predicted")
+
+```
+
+```{r}
+write_csv(pred, "rf_classi_log(m10_85_mn7)")
+```
+
+### Prediction svm
+```{r}
+set.seed(100)
+svm_model <- 
+  svm_rbf(cost = 3.174802	,
+          rbf_sigma = 0.0004641589) %>% 
+  set_mode("classification") %>% 
+  set_engine("kernlab")
+
+svm_wflow <-
+ workflow() %>%
+ add_recipe(log_rec) %>% 
+ add_model(svm_model)
+
+svm_res <- svm_wflow %>%
+  fit(train_data)
+
+pred <- test$id %>% 
+  bind_cols(predict(svm_res, new_data = test))
+colnames(pred) <- c("Id", "Predicted")
+
+```
+
+```{r}
+write_csv(pred, "svm_classi_log(c3.174802_rsigma0.0004641589)")
+```
+
+
+```{r}
+#XGboost best parameters with log/norm rec
+set.seed(10)
+xgb_model_log_norm <- boost_tree(trees = 1270,
+                        tree_depth = 6,
+                        min_n = 12, 
+                        loss_reduction = 3.521858e-09,
+                        sample_size = 0.77090964,
+                        mtry = 3, 
+                        learn_rate = 2.391532e-08) %>% 
+  set_engine("xgboost") %>% 
+  set_mode("classification")
+
+xgb_wf_log <- workflow() %>%
+  add_model(xgb_model_log_norm) %>% 
+  add_recipe(log_rec)
+
+xgb_res_log <- xgb_wf_log %>%
+  fit(train_data)
+
+pred <- test$id %>% 
+  bind_cols(predict(svm_res, new_data = test))
+colnames(pred) <- c("Id", "Predicted")
+```
+
+
+```{r}
+write_csv(pred, "xgb_classi_log(t1270_td6_mn12_mtry3")
+```
